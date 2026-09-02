@@ -12,4 +12,4 @@ gpgkey=https://pkgs.netbird.io/yum/repodata/repomd.xml.key
 repo_gpgcheck=1
 EOF
 
-dnf5 -y install netbird-ui
+rpm-ostree install netbird-ui
