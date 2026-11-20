@@ -2,49 +2,42 @@
 name: build
 on:
   pull_request:
-    branches:
-      - main
+    branches: [ main ]
   schedule:
-    - cron: '20 10 * * *'  # 10:20 UTC everyday
+    - cron: '20 10 * * *'
   push:
-    branches:
-      - main
-    paths-ignore:
-      - '**/README.md'
+    branches: [ main ]
+    paths-ignore: [ '**/README.md' ]
   workflow_dispatch:
+    inputs:
+      skip_base:
+        description: 'Skip building base image (rebuild WM variants on top of existing :latest)'
+        required: false
+        type: boolean
+        default: false
 
 env:
   MY_IMAGE_NAME: "${{ github.event.repository.name }}"
-  MY_IMAGE_DESC: "CentOS Stream-based images"
+  MY_IMAGE_DESC: "Custom Bluefin-based images"
   IMAGE_REGISTRY: "ghcr.io/${{ github.repository_owner }}"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}-${{ inputs.brand_name}}-${{ inputs.stream_name }}
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
-  build_push:
-    name: Build and push (${{ matrix.variant }})
+  build_base:
+    name: Build and push base image
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - variant: base
-            tag_prefix: ""
-          - variant: niri
-            tag_prefix: "niri-"
-          - variant: hyprland
-            tag_prefix: "hyprland-"
-
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_base) }}
+    outputs:
+      base_image: ${{ steps.set_output.outputs.base_image }}
     permissions:
       contents: read
       packages: write
       id-token: write
-
     steps:
-      # Checkout push-to-registry action GitHub repository
-      - name: Checkout Push to Registry action
+      - name: Checkout repository
         uses: actions/checkout@v7
 
       - name: Generate tags
@@ -53,51 +46,41 @@ jobs:
         run: |
           TIMESTAMP="$(date +%Y%m%d)"
           SHA_SHORT="${GITHUB_SHA::7}"
-          PREFIX="${{ matrix.tag_prefix }}"
-          BASE_NAME="${PREFIX%'-'}"
 
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-              alias_tags=("${PREFIX}pr-${{ github.event.number }}" "${PREFIX}${SHA_SHORT}")
+              PRIMARY="pr-${{ github.event.number }}"
+              alias_tags=("${PRIMARY}" "${SHA_SHORT}")
           else
-              if [[ -z "$BASE_NAME" ]]; then
-                  alias_tags=("latest" "${TIMESTAMP}")
-              else
-                  alias_tags=("${BASE_NAME}" "${PREFIX}${TIMESTAMP}")
-              fi
+              PRIMARY="latest"
+              alias_tags=("${PRIMARY}" "${TIMESTAMP}")
           fi
 
-          echo "Generated tags: ${alias_tags[*]}"
+          echo "primary_tag=${PRIMARY}" >> $GITHUB_OUTPUT
           echo "alias_tags=${alias_tags[*]}" >> $GITHUB_OUTPUT
 
-      # Build metadata
       - name: Image Metadata
         uses: docker/metadata-action@v6
         id: meta
         with:
           images: |
             ${{ env.MY_IMAGE_NAME }}
-
           labels: |
-            io.artifacthub.package.readme-url=https://raw.githubusercontent.com/${{ github.repository }}/main/README.md
+            io.artifacthub.package.readme-url=https://githubusercontent.com{{ github.repository }}/main/README.md
             org.opencontainers.image.description=${{ env.MY_IMAGE_DESC }}
             org.opencontainers.image.title=${{ env.MY_IMAGE_NAME }}
 
-      # Build image using Buildah action
       - name: Build Image
         id: build_image
         uses: redhat-actions/buildah-build@v2
         with:
           containerfiles: |
-            ./Containerfile
-          target: ${{ matrix.variant }}
+            ./Containerfile.base
           image: ${{ env.MY_IMAGE_NAME }}
           tags: |
             ${{ steps.generate-tags.outputs.alias_tags }}
           labels: ${{ steps.meta.outputs.labels }}
           oci: false
 
-      # Workaround bug where capital letters in your GitHub username make it impossible to push to GHCR.
-      # https://github.com/macbre/push-to-ghcr/issues/12
       - name: Lowercase Registry
         id: registry_case
         uses: ASzc/change-string-case-action@v8
@@ -126,7 +109,6 @@ jobs:
           extra-args: |
             --compression-format=zstd
 
-      # Sign container
       - uses: sigstore/cosign-installer@v3.8.2
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
 
@@ -139,3 +121,118 @@ jobs:
           COSIGN_EXPERIMENTAL: false
           COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
 
+      - name: Export base image reference
+        id: set_output
+        run: |
+          echo "base_image=${{ steps.registry_case.outputs.lowercase }}/${{ env.MY_IMAGE_NAME }}:${{ steps.generate-tags.outputs.primary_tag }}" >> $GITHUB_OUTPUT
+
+  build_variants:
+    name: Build and push (${{ matrix.wm }})
+    needs: build_base
+    if: always() && (needs.build_base.result == 'success' || needs.build_base.result == 'skipped')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        wm: [ niri, hyprland ]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Lowercase Registry
+        id: registry_case
+        uses: ASzc/change-string-case-action@v8
+        with:
+          string: ${{ env.IMAGE_REGISTRY }}
+
+      - name: Resolve base image
+        id: resolve_base
+        shell: bash
+        run: |
+          if [[ -n "${{ needs.build_base.outputs.base_image }}" ]]; then
+              echo "image=${{ needs.build_base.outputs.base_image }}" >> $GITHUB_OUTPUT
+          else
+              echo "image=${{ steps.registry_case.outputs.lowercase }}/${{ env.MY_IMAGE_NAME }}:latest" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate tags
+        id: generate-tags
+        shell: bash
+        run: |
+          TIMESTAMP="$(date +%Y%m%d)"
+          SHA_SHORT="${GITHUB_SHA::7}"
+          WM="${{ matrix.wm }}"
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+              alias_tags=("${WM}-pr-${{ github.event.number }}" "${WM}-${SHA_SHORT}")
+          else
+              alias_tags=("${WM}" "${WM}-${TIMESTAMP}")
+          fi
+
+          echo "alias_tags=${alias_tags[*]}" >> $GITHUB_OUTPUT
+
+      - name: Image Metadata
+        uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: |
+            ${{ env.MY_IMAGE_NAME }}
+          labels: |
+            io.artifacthub.package.readme-url=https://githubusercontent.com{{ github.repository }}/main/README.md
+            org.opencontainers.image.description=${{ env.MY_IMAGE_DESC }} (${{ matrix.wm }})
+            org.opencontainers.image.title=${{ env.MY_IMAGE_NAME }}-${{ matrix.wm }}
+
+      - name: Build Image
+        id: build_image
+        uses: redhat-actions/buildah-build@v2
+        with:
+          containerfiles: |
+            ./Containerfile.wm
+          build-args: |
+            BASE_IMAGE=${{ steps.resolve_base.outputs.image }}
+            WM_NAME=${{ matrix.wm }}
+          image: ${{ env.MY_IMAGE_NAME }}
+          tags: |
+            ${{ steps.generate-tags.outputs.alias_tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          oci: false
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push Image to GHCR
+        uses: redhat-actions/push-to-registry@v3
+        id: push
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ github.token }}
+        with:
+          image: ${{ steps.build_image.outputs.image }}
+          tags: ${{ steps.build_image.outputs.tags }}
+          registry: ${{ steps.registry_case.outputs.lowercase }}
+          username: ${{ env.REGISTRY_USER }}
+          password: ${{ env.REGISTRY_PASSWORD }}
+          extra-args: |
+            --compression-format=zstd
+
+      - uses: sigstore/cosign-installer@v3.8.2
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+
+      - name: Sign container image
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          cosign sign -y --key env://COSIGN_PRIVATE_KEY ${{ steps.registry_case.outputs.lowercase }}/${{ steps.build_image.outputs.image }}@${TAGS}
+        env:
+          TAGS: ${{ steps.push.outputs.digest }}
+          COSIGN_EXPERIMENTAL: false
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+
+        

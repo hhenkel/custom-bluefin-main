@@ -1,0 +1,13 @@
+ARG BASE_IMAGE=ghcr.io/ublue-os/bluefin:stable
+FROM ${BASE_IMAGE}
+
+ARG WM_NAME
+COPY build-${WM_NAME}.sh /tmp/build-wm.sh
+
+RUN chmod +x /tmp/build-wm.sh && \
+    /tmp/build-wm.sh && \
+    rm -f /tmp/build-wm.sh && \
+    dnf5 clean all && \
+    ostree container commit
+
+RUN bootc container lint
