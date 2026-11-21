@@ -1,6 +1,8 @@
 FROM ghcr.io/ublue-os/bluefin:stable
 
 COPY build-base.sh /tmp/build-base.sh
+COPY nix-subvol-setup.service /usr/lib/systemd/system/nix-subvol-setup.service
+COPY /usr/libexec/setup-nix-subvol.sh /usr/libexec/setup-nix-subvol.sh
 
 RUN chmod +x /tmp/build-base.sh &&\
     /tmp/build-base.sh && \

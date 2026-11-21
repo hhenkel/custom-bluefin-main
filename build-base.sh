@@ -13,3 +13,9 @@ repo_gpgcheck=1
 EOF
 
 rpm-ostree install netbird-ui
+
+
+RUN mkdir -p /nix && \
+    chmod +x /usr/libexec/setup-nix-subvol.sh && \
+    systemctl enable nix-subvol-setup.service
+
